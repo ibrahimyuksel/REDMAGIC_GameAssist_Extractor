@@ -1,38 +1,40 @@
-name: ROM Explorer v2 - Selective Extraction
+name: ROM Dosya Gezgini v2 - Seçmeli Dosya Çıkarma
 on:
   workflow_dispatch:
     inputs:
-      source_url:
-        description: 'Public direct HTTPS archive URL'
+      rom_baglantisi:
+        description: 'ROM dosyasının doğrudan HTTPS indirme bağlantısı'
         required: true
         type: string
-      target_files:
-        description: 'Comma-separated filenames or wildcards'
+      aranacak_dosyalar:
+        description: 'Çıkarılacak dosya adları (örnek: GameAssist*.apk,*.so)'
         required: false
         default: 'GameAssist*.apk'
         type: string
-      action_mode:
-        description: 'List contents or extract matches'
+      islem_turu:
+        description: 'ROM içindeki dosyaları listele veya seçtiklerini çıkar'
         required: true
-        default: extract
+        default: 'Dosyaları çıkar'
         type: choice
-        options: [list, extract]
-      zip_parts:
-        description: 'Number of sequential .zip.00 segments, 1 for normal archive'
+        options:
+          - 'Dosyaları çıkar'
+          - 'Yalnızca listele'
+      zip_parca_sayisi:
+        description: 'Normal arşiv için 1; .zip.00-.zip.03 gibi dört parça için 4'
         required: true
         default: '1'
         type: string
-      partitions:
-        description: 'system, system_ext, product, vendor, odm, all, none'
+      taranacak_bolumler:
+        description: 'system, system_ext, product, vendor, odm; all=tümü, none=yalnızca arşiv'
         required: true
-        default: system
+        default: 'system'
         type: string
-      source_sha256:
-        description: 'Optional full-archive SHA256'
+      rom_sha256:
+        description: 'Varsa ROM dosyasının SHA-256 doğrulama değeri (isteğe bağlı)'
         required: false
         type: string
-      max_files:
-        description: 'Max matched files (1-30)'
+      azami_dosya_sayisi:
+        description: 'Çıkarılabilecek en fazla dosya sayısı (1-30)'
         required: true
         default: '20'
         type: string
@@ -40,11 +42,13 @@ permissions:
   contents: read
 jobs:
   explorer:
+    name: ROM'u bulutta tara ve seçilen dosyaları çıkar
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
-      - name: Prepare cloud runner
+      - name: Depodaki kodları hazırla
+        uses: actions/checkout@v4
+      - name: Bulut sunucusunu hazırla
         run: |
           set -euo pipefail
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
@@ -52,32 +56,47 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends brotli erofs-utils unzip e2fsprogs
           sudo apt-get clean
           df -h /
-      - name: Run tests
+      - name: Testleri çalıştır
         run: |
           python3 tests/test_restore_sdat_stream.py
           python3 -m unittest discover -s tests -p 'test_rom_explorer_v2.py' -v
-      - name: Download on GitHub and explore ROM
+      - name: ROM'u GitHub'a indir ve dosyaları bul
         id: explore
         continue-on-error: true
         env:
-          SOURCE_URL: ${{ inputs.source_url }}
-          FILE_PATTERN: ${{ inputs.target_files }}
-          MODE: ${{ inputs.action_mode }}
-          PARTS: ${{ inputs.zip_parts }}
-          PARTITIONS: ${{ inputs.partitions }}
-          CHECKSUM: ${{ inputs.source_sha256 }}
-          MAX_FILES: ${{ inputs.max_files }}
+          SOURCE_URL: ${{ inputs.rom_baglantisi }}
+          FILE_PATTERN: ${{ inputs.aranacak_dosyalar }}
+          MODE_TR: ${{ inputs.islem_turu }}
+          PARTS: ${{ inputs.zip_parca_sayisi }}
+          PARTITIONS: ${{ inputs.taranacak_bolumler }}
+          CHECKSUM: ${{ inputs.rom_sha256 }}
+          MAX_FILES: ${{ inputs.azami_dosya_sayisi }}
         run: |
-          python3 scripts/rom_explorer_v2.py --url "$SOURCE_URL" --patterns "$FILE_PATTERN" --mode "$MODE" --parts "$PARTS" --partitions "$PARTITIONS" --sha256 "$CHECKSUM" --max-files "$MAX_FILES" --work "$RUNNER_TEMP/rom-explorer-work" --out "$GITHUB_WORKSPACE/explorer-output"
-      - name: Upload report and selected files
+          set -euo pipefail
+          case "$MODE_TR" in
+            'Dosyaları çıkar') MODE=extract ;;
+            'Yalnızca listele') MODE=list ;;
+            *) echo 'Geçersiz işlem türü' >&2; exit 1 ;;
+          esac
+          python3 scripts/rom_explorer_v2.py \
+            --url "$SOURCE_URL" \
+            --patterns "$FILE_PATTERN" \
+            --mode "$MODE" \
+            --parts "$PARTS" \
+            --partitions "$PARTITIONS" \
+            --sha256 "$CHECKSUM" \
+            --max-files "$MAX_FILES" \
+            --work "$RUNNER_TEMP/rom-explorer-work" \
+            --out "$GITHUB_WORKSPACE/explorer-output"
+      - name: Bulunan dosyaları ve raporu Artifacts'a yükle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ROM-Explorer-v2-Results
+          name: ROM-Explorer-v2-Sonuclar
           path: explorer-output/
           if-no-files-found: warn
           compression-level: 5
           retention-days: 7
-      - name: Fail on unsuccessful extraction
+      - name: Çıkarma başarısızsa hatayı bildir
         if: steps.explore.outcome != 'success'
         run: exit 1
