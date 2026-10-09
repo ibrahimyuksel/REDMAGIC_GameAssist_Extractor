@@ -1,0 +1,116 @@
+name: Extract REDMAGIC SurfaceFlinger Backend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract-native-backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out extraction scripts
+        uses: actions/checkout@v4
+
+      - name: Prepare tools and disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends brotli erofs-utils unzip file binutils
+          sudo apt-get clean
+          mkdir -p "$RUNNER_TEMP/redmagic" "$GITHUB_WORKSPACE/native-backend"
+          df -h /
+
+      - name: Download verified ROM pieces to GitHub runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          ROM="$DIR/rom.zip"
+          PART="$DIR/part.tmp"
+          BASE="https://github.com/jawadaboumehsen/LtiRom/releases/download/global-fifteen/Lti_1.0.0-9bbb01b-dirty_20260806_PQ84P01-sign.zip"
+          EXPECTED_PARTS=(
+            ead8a5a25cd4328986ebb00c9f7d1c265c51d91f80c6fc0eb30fc91ae1b814f0
+            344f7410c92f008cf546a916b349c3fc31062600b04cc38481e0657320a9f531
+            91628e67570a89a094ad55d8f012c2754d0dbe47cd012e54769a09057810901a
+            30708897bb9672ea12a4ea3a57bda089d1f25b582e98e8b945ecab6734feb2b2
+          )
+          for i in 0 1 2 3; do
+            suffix=$(printf '%02d' "$i")
+            echo "ROM part $suffix / 03"
+            curl --fail --location --retry 5 --retry-delay 5 --retry-all-errors \
+              --connect-timeout 30 --silent --show-error "${BASE}.${suffix}" -o "$PART"
+            printf '%s  %s\n' "${EXPECTED_PARTS[$i]}" "$PART" | sha256sum --check --status
+            cat "$PART" >> "$ROM"
+            rm "$PART"
+          done
+          printf '%s  %s\n' \
+            '7b5829860343f297c5ea7d636fb39b4768a2ac3b4c184d8ad9e353d04d0ab383' "$ROM" \
+            | sha256sum --check
+          unzip -tq "$ROM" >/dev/null
+
+      - name: Extract only system framework and SurfaceFlinger binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          ROM="$DIR/rom.zip"
+          OUT="$GITHUB_WORKSPACE/native-backend"
+          mkdir -p "$DIR/mount"
+          mapfile -t TRANSFERS < <(unzip -Z1 "$ROM" | grep -E '(^|/)system\.transfer\.list$' || true)
+          mapfile -t DAT_FILES < <(unzip -Z1 "$ROM" | grep -E '(^|/)system\.new\.dat\.br$' || true)
+          if [ "${#TRANSFERS[@]}" -ne 1 ] || [ "${#DAT_FILES[@]}" -ne 1 ]; then
+            echo "Missing or ambiguous system image in source ROM" >&2
+            exit 1
+          fi
+          unzip -p "$ROM" "${TRANSFERS[0]}" > "$DIR/system.transfer.list"
+          unzip -p "$ROM" "${DAT_FILES[0]}" | brotli -dc | \
+            python3 "$GITHUB_WORKSPACE/scripts/restore_sdat_stream.py" \
+              "$DIR/system.transfer.list" "$DIR/system.img"
+          rm "$ROM"
+          sudo mount -t erofs -o ro,loop "$DIR/system.img" "$DIR/mount"
+          trap 'sudo umount "$DIR/mount" 2>/dev/null || true' EXIT
+          mkdir -p "$OUT/system"
+          : > "$OUT/FILES.txt"
+          for rel in \
+            'system/framework/system-services-platform.jar' \
+            'system/framework/system-services.jar' \
+            'system/lib64/libsurfaceflinger.so' \
+            'system/bin/surfaceflinger' \
+            'system/lib64/libui.so' \
+            'system/lib64/libcompositionengine.so'; do
+            src="$DIR/mount/$rel"
+            if [ -f "$src" ]; then
+              size=$(stat -c%s "$src")
+              if [ "$size" -gt 125000000 ]; then
+                echo "SKIPPED too large: $rel ($size bytes)" | tee -a "$OUT/FILES.txt"
+                continue
+              fi
+              mkdir -p "$OUT/$(dirname "$rel")"
+              cp "$src" "$OUT/$rel"
+              echo "EXTRACTED $rel ($size bytes)" | tee -a "$OUT/FILES.txt"
+            else
+              echo "MISSING $rel" | tee -a "$OUT/FILES.txt"
+            fi
+          done
+          {
+            echo "Source: LtiRom global-fifteen REDMAGIC Astra PQ84P01"
+            echo "Purpose: statically inspect OEM SurfaceFlinger and related framework code"
+            echo "WARNING: extracted artifacts are not compatible with other Android devices"
+          } > "$OUT/ABOUT.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+          du -sh "$OUT"
+          test "$(find "$OUT/system" -type f | wc -l)" -gt 0
+
+      - name: Upload targeted backend for static analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: REDMAGIC-SurfaceFlinger-Backend
+          path: native-backend/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
