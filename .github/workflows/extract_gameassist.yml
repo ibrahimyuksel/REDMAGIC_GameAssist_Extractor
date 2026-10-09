@@ -1,0 +1,133 @@
+name: Extract REDMAGIC GameAssist 15.5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out extraction scripts
+        uses: actions/checkout@v4
+
+      - name: Prepare temporary cloud runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This is a disposable GitHub-hosted VM, not your computer.
+          # Its Android, .NET and CodeQL SDKs are not needed here.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends brotli erofs-utils unzip file
+          sudo apt-get clean
+          mkdir -p "$RUNNER_TEMP/redmagic" "$GITHUB_WORKSPACE/output"
+          df -h /
+
+      - name: Download and verify four ROM parts in the cloud
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          ROM="$DIR/rom.zip"
+          PART="$DIR/part.tmp"
+          BASE="https://github.com/jawadaboumehsen/LtiRom/releases/download/global-fifteen/Lti_1.0.0-9bbb01b-dirty_20260806_PQ84P01-sign.zip"
+          EXPECTED_PARTS=(
+            ead8a5a25cd4328986ebb00c9f7d1c265c51d91f80c6fc0eb30fc91ae1b814f0
+            344f7410c92f008cf546a916b349c3fc31062600b04cc38481e0657320a9f531
+            91628e67570a89a094ad55d8f012c2754d0dbe47cd012e54769a09057810901a
+            30708897bb9672ea12a4ea3a57bda089d1f25b582e98e8b945ecab6734feb2b2
+          )
+          for i in 0 1 2 3; do
+            suffix=$(printf '%02d' "$i")
+            echo "Downloading ROM part $suffix / 03 to the cloud runner..."
+            curl --fail --location --retry 5 --retry-delay 5 --retry-all-errors \
+              --connect-timeout 30 --silent --show-error "${BASE}.${suffix}" -o "$PART"
+            printf '%s  %s\n' "${EXPECTED_PARTS[$i]}" "$PART" | sha256sum --check --status
+            cat "$PART" >> "$ROM"
+            rm "$PART"
+            df -h / | tail -1
+          done
+          printf '%s  %s\n' \
+            '7b5829860343f297c5ea7d636fb39b4768a2ac3b4c184d8ad9e353d04d0ab383' "$ROM" \
+            | sha256sum --check
+          echo 'ROM archive integrity verified.'
+          unzip -tq "$ROM" >/dev/null
+          echo 'ROM ZIP integrity verified.'
+
+      - name: Rebuild only the Android system partition
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          ROM="$DIR/rom.zip"
+          mapfile -t TRANSFERS < <(unzip -Z1 "$ROM" | grep -E '(^|/)system\.transfer\.list$' || true)
+          mapfile -t DAT_FILES < <(unzip -Z1 "$ROM" | grep -E '(^|/)system\.new\.dat\.br$' || true)
+          if [ "${#TRANSFERS[@]}" -ne 1 ] || [ "${#DAT_FILES[@]}" -ne 1 ]; then
+            echo 'Expected exactly one system.transfer.list and system.new.dat.br in the archive.' >&2
+            unzip -Z1 "$ROM" | grep -E '(^|/)(system|product)\.' | head -20 || true
+            exit 1
+          fi
+          unzip -p "$ROM" "${TRANSFERS[0]}" > "$DIR/system.transfer.list"
+          unzip -p "$ROM" "${DAT_FILES[0]}" | brotli -dc | \
+            python3 "$GITHUB_WORKSPACE/scripts/restore_sdat_stream.py" \
+              "$DIR/system.transfer.list" "$DIR/system.img"
+          # Free ~7 GB before accessing the reconstructed filesystem.
+          rm "$ROM"
+          file "$DIR/system.img"
+          df -h /
+
+      - name: Extract only GameAssist15_5.apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          MOUNT="$DIR/system-mount"
+          mkdir -p "$MOUNT"
+          if ! sudo mount -t erofs -o ro,loop "$DIR/system.img" "$MOUNT"; then
+            echo 'EROFS loop mount is unavailable on this runner.' >&2
+            echo 'No APK has been extracted. Do not report this job as successful.' >&2
+            exit 1
+          fi
+          trap 'sudo umount "$MOUNT" 2>/dev/null || true' EXIT
+          SOURCE=''
+          for rel in \
+            'app/GameAssist15_5/GameAssist15_5.apk' \
+            'system/app/GameAssist15_5/GameAssist15_5.apk' \
+            'priv-app/GameAssist15_5/GameAssist15_5.apk' \
+            'system/priv-app/GameAssist15_5/GameAssist15_5.apk'; do
+            if [ -f "$MOUNT/$rel" ]; then
+              SOURCE="$MOUNT/$rel"
+              break
+            fi
+          done
+          if [ -z "$SOURCE" ]; then
+            echo 'Target APK missing. Possible GameAssist APK names:' >&2
+            find "$MOUNT" -type f -iname '*gameassist*.apk' -print | head -30 >&2 || true
+            exit 1
+          fi
+          APK="$GITHUB_WORKSPACE/output/GameAssist15_5.apk"
+          cp -- "$SOURCE" "$APK"
+          unzip -tq "$APK" >/dev/null
+          unzip -Z1 "$APK" | grep -qx 'AndroidManifest.xml'
+          (cd "$GITHUB_WORKSPACE/output" && sha256sum GameAssist15_5.apk > SHA256SUMS.txt)
+          {
+            echo 'Source: jawadaboumehsen/LtiRom release global-fifteen'
+            echo 'Target: REDMAGIC Astra / NP05J / PQ84P01'
+            echo 'Expected GameAssist: 15.5.001.2603051437 (not independently checked by package parser)'
+            echo "Located at: ${SOURCE#"$MOUNT/"}"
+            echo "Size: $(stat -c%s "$APK") bytes"
+          } > "$GITHUB_WORKSPACE/output/EXTRACTION_INFO.txt"
+          ls -lh "$GITHUB_WORKSPACE/output"
+
+      - name: Upload the small APK only
+        uses: actions/upload-artifact@v4
+        with:
+          name: REDMAGIC-GameAssist15_5-APK
+          path: output/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
