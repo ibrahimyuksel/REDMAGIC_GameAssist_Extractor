@@ -1,0 +1,83 @@
+name: ROM Explorer v2 - Selective Extraction
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: 'Public direct HTTPS archive URL'
+        required: true
+        type: string
+      target_files:
+        description: 'Comma-separated filenames or wildcards'
+        required: false
+        default: 'GameAssist*.apk'
+        type: string
+      action_mode:
+        description: 'List contents or extract matches'
+        required: true
+        default: extract
+        type: choice
+        options: [list, extract]
+      zip_parts:
+        description: 'Number of sequential .zip.00 segments, 1 for normal archive'
+        required: true
+        default: '1'
+        type: string
+      partitions:
+        description: 'system, system_ext, product, vendor, odm, all, none'
+        required: true
+        default: system
+        type: string
+      source_sha256:
+        description: 'Optional full-archive SHA256'
+        required: false
+        type: string
+      max_files:
+        description: 'Max matched files (1-30)'
+        required: true
+        default: '20'
+        type: string
+permissions:
+  contents: read
+jobs:
+  explorer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare cloud runner
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends brotli erofs-utils unzip e2fsprogs
+          sudo apt-get clean
+          df -h /
+      - name: Run tests
+        run: |
+          python3 tests/test_restore_sdat_stream.py
+          python3 -m unittest discover -s tests -p 'test_rom_explorer_v2.py' -v
+      - name: Download on GitHub and explore ROM
+        id: explore
+        continue-on-error: true
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          FILE_PATTERN: ${{ inputs.target_files }}
+          MODE: ${{ inputs.action_mode }}
+          PARTS: ${{ inputs.zip_parts }}
+          PARTITIONS: ${{ inputs.partitions }}
+          CHECKSUM: ${{ inputs.source_sha256 }}
+          MAX_FILES: ${{ inputs.max_files }}
+        run: |
+          python3 scripts/rom_explorer_v2.py --url "$SOURCE_URL" --patterns "$FILE_PATTERN" --mode "$MODE" --parts "$PARTS" --partitions "$PARTITIONS" --sha256 "$CHECKSUM" --max-files "$MAX_FILES" --work "$RUNNER_TEMP/rom-explorer-work" --out "$GITHUB_WORKSPACE/explorer-output"
+      - name: Upload report and selected files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ROM-Explorer-v2-Results
+          path: explorer-output/
+          if-no-files-found: warn
+          compression-level: 5
+          retention-days: 7
+      - name: Fail on unsuccessful extraction
+        if: steps.explore.outcome != 'success'
+        run: exit 1
