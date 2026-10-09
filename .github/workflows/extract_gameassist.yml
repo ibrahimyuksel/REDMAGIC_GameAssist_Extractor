@@ -2,6 +2,26 @@ name: Extract REDMAGIC GameAssist 15.5
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'browse: list ROM files | extract: selected files | gameassist: original APK'
+        required: true
+        default: browse
+        type: choice
+        options:
+          - browse
+          - extract
+          - gameassist
+      search:
+        description: 'browse: search terms, separated by commas'
+        required: false
+        default: 'GameAssist,GameSpace,Hunt'
+        type: string
+      selected_paths:
+        description: 'extract: ROM path or glob, separated by commas'
+        required: false
+        default: 'app/GameAssist15_5/GameAssist15_5.apk'
+        type: string
 
 permissions:
   contents: read
@@ -13,6 +33,13 @@ jobs:
     steps:
       - name: Check out extraction scripts
         uses: actions/checkout@v4
+
+      - name: Validate scripts without downloading ROM
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/test_restore_sdat_stream.py
+          python3 -m unittest discover -s tests -p 'test_rom_browser.py' -v
 
       - name: Prepare temporary cloud runner
         shell: bash
@@ -80,7 +107,8 @@ jobs:
           file "$DIR/system.img"
           df -h /
 
-      - name: Extract only GameAssist15_5.apk
+      - name: Extract only GameAssist15_5.apk (original mode)
+        if: ${{ inputs.mode == 'gameassist' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -123,10 +151,39 @@ jobs:
           } > "$GITHUB_WORKSPACE/output/EXTRACTION_INFO.txt"
           ls -lh "$GITHUB_WORKSPACE/output"
 
-      - name: Upload the small APK only
+      - name: Browse ROM or extract selected files
+        if: ${{ inputs.mode == 'browse' || inputs.mode == 'extract' }}
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          SEARCH: ${{ inputs.search }}
+          SELECTED_PATHS: ${{ inputs.selected_paths }}
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          MOUNT="$DIR/system-mount"
+          mkdir -p "$MOUNT"
+          if ! sudo mount -t erofs -o ro,loop "$DIR/system.img" "$MOUNT"; then
+            echo 'Cannot mount ROM system partition. No files were exported.' >&2
+            exit 1
+          fi
+          trap 'sudo umount "$MOUNT" 2>/dev/null || true' EXIT
+          if [ "$MODE" = browse ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/rom_browser.py" browse \
+              --root "$MOUNT" --output "$GITHUB_WORKSPACE/output" --search "$SEARCH"
+          elif [ "$MODE" = extract ]; then
+            python3 "$GITHUB_WORKSPACE/scripts/rom_browser.py" extract \
+              --root "$MOUNT" --output "$GITHUB_WORKSPACE/output" --paths "$SELECTED_PATHS"
+          else
+            echo "Unsupported mode: $MODE" >&2
+            exit 1
+          fi
+          ls -lh "$GITHUB_WORKSPACE/output"
+
+      - name: Upload only the selected results
         uses: actions/upload-artifact@v4
         with:
-          name: REDMAGIC-GameAssist15_5-APK
+          name: ${{ inputs.mode == 'browse' && 'REDMAGIC-ROM-File-Index' || inputs.mode == 'extract' && 'REDMAGIC-Selected-Files' || 'REDMAGIC-GameAssist15_5-APK' }}
           path: output/
           if-no-files-found: error
           compression-level: 0

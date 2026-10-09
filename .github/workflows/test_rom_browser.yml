@@ -1,0 +1,25 @@
+name: Validate ROM Explorer
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/extract_gameassist.yml'
+      - '.github/workflows/test_rom_browser.yml'
+      - 'scripts/**'
+      - 'tests/**'
+  push:
+    branches:
+      - feat/rom-file-explorer
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests without downloading the ROM
+        run: |
+          python3 tests/test_restore_sdat_stream.py
+          python3 -m unittest discover -s tests -p 'test_rom_browser.py' -v
