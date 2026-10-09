@@ -1,0 +1,102 @@
+name: Scan REDMAGIC Hunt Backend
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out extraction scripts
+        uses: actions/checkout@v4
+
+      - name: Prepare temporary cloud runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends brotli erofs-utils unzip file
+          sudo apt-get clean
+          mkdir -p "$RUNNER_TEMP/redmagic" "$GITHUB_WORKSPACE/backend-output"
+          df -h /
+
+      - name: Download and verify four ROM parts in the cloud
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          ROM="$DIR/rom.zip"
+          PART="$DIR/part.tmp"
+          BASE="https://github.com/jawadaboumehsen/LtiRom/releases/download/global-fifteen/Lti_1.0.0-9bbb01b-dirty_20260806_PQ84P01-sign.zip"
+          EXPECTED_PARTS=(
+            ead8a5a25cd4328986ebb00c9f7d1c265c51d91f80c6fc0eb30fc91ae1b814f0
+            344f7410c92f008cf546a916b349c3fc31062600b04cc38481e0657320a9f531
+            91628e67570a89a094ad55d8f012c2754d0dbe47cd012e54769a09057810901a
+            30708897bb9672ea12a4ea3a57bda089d1f25b582e98e8b945ecab6734feb2b2
+          )
+          for i in 0 1 2 3; do
+            suffix=$(printf '%02d' "$i")
+            echo "Downloading ROM part $suffix / 03 to the cloud runner..."
+            curl --fail --location --retry 5 --retry-delay 5 --retry-all-errors \
+              --connect-timeout 30 --silent --show-error "${BASE}.${suffix}" -o "$PART"
+            printf '%s  %s\n' "${EXPECTED_PARTS[$i]}" "$PART" | sha256sum --check --status
+            cat "$PART" >> "$ROM"
+            rm "$PART"
+            df -h / | tail -1
+          done
+          printf '%s  %s\n' \
+            '7b5829860343f297c5ea7d636fb39b4768a2ac3b4c184d8ad9e353d04d0ab383' "$ROM" \
+            | sha256sum --check
+          unzip -tq "$ROM" >/dev/null
+          echo 'ROM SHA-256 and ZIP integrity verified.'
+
+      - name: Scan system and vendor components for the effect handler
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/redmagic"
+          ROM="$DIR/rom.zip"
+          OUT="$GITHUB_WORKSPACE/backend-output"
+          mkdir -p "$OUT" "$DIR/mount"
+          unzip -Z1 "$ROM" > "$DIR/zip_entries.txt"
+          for part in system system_ext product vendor odm; do
+            echo "========== PARTITION $part =========="
+            transfer=$(grep -E "(^|/)$part\.transfer\.list$" "$DIR/zip_entries.txt" | head -n 1 || true)
+            dat=$(grep -E "(^|/)$part\.new\.dat\.br$" "$DIR/zip_entries.txt" | head -n 1 || true)
+            if [[ -z "$transfer" || -z "$dat" ]]; then
+              echo "$part: no full block OTA entries" | tee -a "$OUT/partitions_skipped.txt"
+              continue
+            fi
+            unzip -p "$ROM" "$transfer" > "$DIR/$part.transfer.list"
+            unzip -p "$ROM" "$dat" | brotli -dc | \
+              python3 "$GITHUB_WORKSPACE/scripts/restore_sdat_stream.py" \
+                "$DIR/$part.transfer.list" "$DIR/$part.img"
+            file "$DIR/$part.img"
+            if sudo mount -t erofs -o ro,loop "$DIR/$part.img" "$DIR/mount"; then
+              python3 "$GITHUB_WORKSPACE/scripts/scan_redmagic_backend.py" \
+                --root "$DIR/mount" --partition "$part" --output "$OUT"
+              sudo umount "$DIR/mount"
+            else
+              echo "$part: EROFS mount failed" | tee -a "$OUT/partitions_skipped.txt"
+            fi
+            rm -f "$DIR/$part.img" "$DIR/$part.transfer.list"
+            df -h / | tail -n 1
+          done
+          python3 "$GITHUB_WORKSPACE/scripts/scan_redmagic_backend.py" \
+            --finalize --output "$OUT"
+          ls -lh "$OUT"
+
+      - name: Upload scan report and selected backend candidates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: REDMAGIC-Hunt-Backend-Scan
+          path: backend-output/
+          if-no-files-found: error
+          compression-level: 5
+          retention-days: 7
